@@ -1,0 +1,19 @@
+.venv/
+__pycache__/
+.ipynb_checkpoints/
+faiss_index/
+*.pdf
+key.txt
+.env
+
+# Google API Credentials
+credentials.json
+token.json
+
+# OS specific files
+.DS_Store
+Thumbs.db
+
+# IDE settings
+.vscode/
+.idea/
