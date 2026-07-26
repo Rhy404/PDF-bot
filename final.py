@@ -2,20 +2,17 @@ import os
 import base64
 from email.message import EmailMessage
 from dotenv import load_dotenv
-from langchain_community.document_loaders import PyPDFLoader
-from langchain_text_splitters import RecursiveCharacterTextSplitter
-from langchain_huggingface import HuggingFaceEmbeddings
-from langchain_community.vectorstores import FAISS
-from langchain_groq import ChatGroq
-from langchain_core.prompts import ChatPromptTemplate
-from langchain_core.runnables import RunnablePassthrough
-from langchain_core.output_parsers import JsonOutputParser
+from langgraph.graph import StateGraph, END
+
+# Import from agents.py
+from agents import AgentState, policy_auditor, email_drafter, compliance_critic, missing_info_checker
+
+# Google API Imports
 from google.auth.transport.requests import Request
 from google.oauth2.credentials import Credentials
 from google_auth_oauthlib.flow import InstalledAppFlow
 from googleapiclient.discovery import build
-
-# 1. Setup
+# gmail setup
 load_dotenv()
 SCOPES = ['https://www.googleapis.com/auth/gmail.compose']
 
@@ -33,56 +30,70 @@ def get_gmail_service():
             token.write(creds.to_json())
     return build('gmail', 'v1', credentials=creds)
 
-# 2. Initialize LLM
-llm = ChatGroq(model="llama-3.3-70b-versatile", temperature=0)
 
-# 3. RAG Setup
-loader = PyPDFLoader("club_policy.pdf")
-chunks = RecursiveCharacterTextSplitter(chunk_size=600, chunk_overlap=100).split_documents(loader.load())
-vectorstore = FAISS.from_documents(chunks, HuggingFaceEmbeddings(model_name="all-MiniLM-L6-v2"))
-retriever = vectorstore.as_retriever(search_kwargs={"k": 6})
-
-# 4. Improved Prompt
-email_template = """
-You are the Email Bot for Club INFERNO. 
-Strictly follow the Club Policy provided in the context.
-
-Context: {context}
-User Request: {question}
-
-Instructions:
-- Identify if the request has multiple procedures (e.g., Hostels vs. General Campus). 
-- If the user hasn't specified a location, default to the most formal procedure but include a note in the body asking them to confirm the location.
-- Extract the "To" email and the "CC" email exactly as written in the policy.
-- Output ONLY a JSON object with: "to", "cc", "subject", "body". 
-- If no CC is mentioned, leave the "cc" field as an empty string.
-- If you need more information from the user, clarify and ask the user again.
-- Keep in mind we are a Cultual Club - INFERNO, and also use our INFERNO 2026-2027 signature which we already made, in every single mail draft.
-- Draft mails with content in a formal tone.
-
-JSON Output:"""
-
-email_chain = (
-    {"context": retriever, "question": RunnablePassthrough()}
-    | ChatPromptTemplate.from_template(email_template)
-    | llm
-    | JsonOutputParser()
-)
-
-# 5. Updated Draft Function (Handles CC)
+# gmail draftin function
 def create_gmail_draft(data):
+    """Takes the JSON output from the agents and pushes it to Gmail drafts."""
     service = get_gmail_service()
     message = EmailMessage()
+    
     message.set_content(data['body'])
     message['To'] = data['to']
     message['Cc'] = data.get('cc', '')
     message['Subject'] = data['subject']
-
+    
     raw = base64.urlsafe_b64encode(message.as_bytes()).decode()
+    
+    # actual gmail api call
     service.users().drafts().create(userId='me', body={'message': {'raw': raw}}).execute()
-    print("Draft created with CC successfully.")
+    print("\n[System] Draft created successfully in your Gmail.")
+    
+# langgraph orchestration-----------------------
+ 
+# flow: Start->Auditor->MissingInfoChecker->Drafter->ComplianceCritic->END
+workflow = StateGraph(AgentState)
 
+workflow.add_node("auditor", policy_auditor)
+workflow.add_node("checker", missing_info_checker)
+workflow.add_node("drafter", email_drafter)
+workflow.add_node("critic", compliance_critic)
+
+
+workflow.set_entry_point("auditor")
+workflow.add_edge("auditor", "checker")
+
+# condition to check missing info
+def check_info_gate(state: AgentState):
+    if state.get("is_info_missing"):
+        return END
+    return "drafter"
+
+workflow.add_conditional_edges("checker", check_info_gate)
+
+workflow.add_edge("drafter", "critic") 
+
+# condition to reach END
+def should_continue(state: AgentState):
+    if state.get("compliance_score") or state["iterations"] > 3:
+        return END
+    return "drafter"
+
+workflow.add_conditional_edges("critic", should_continue)
+
+# compile graph into an executable
+app = workflow.compile()
+
+# executor
 if __name__ == "__main__":
-    query = "Draft an email for putting up digital standees for our upcoming showcase."
-    email_data = email_chain.invoke(query)
-    create_gmail_draft(email_data)
+    print("INFERNO Club Email Bot: ACTIVE")
+    
+    # input from user
+    user_query = "We need permission to get a digital standee for our event."
+
+    final_state = app.invoke({"query": user_query, "iterations": 0})
+    
+    if final_state.get("is_info_missing"):
+        print(f"\n[Agent Response]\n{final_state['missing_info_msg']}")
+        
+    else:
+        create_gmail_draft(final_state["draft_data"])
